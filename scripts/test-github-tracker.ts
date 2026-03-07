@@ -53,14 +53,17 @@ function fetchOpenPRs(): PRSummary[] {
   const raw = ghJson<any[]>(
     `gh search prs --author ${AUTHOR} --state open --json repository,title,url,createdAt,updatedAt,number --limit 100`
   );
-  return raw.map((pr) => ({
-    number: pr.number,
-    title: pr.title,
-    repo: pr.repository.nameWithOwner,
-    url: pr.url,
-    updatedAt: pr.updatedAt,
-    createdAt: pr.createdAt,
-  }));
+  const EXCLUDED_ORGS = ["hivo-org"];
+  return raw
+    .filter((pr) => !EXCLUDED_ORGS.some((org) => pr.repository.nameWithOwner.startsWith(org + "/")))
+    .map((pr) => ({
+      number: pr.number,
+      title: pr.title,
+      repo: pr.repository.nameWithOwner,
+      url: pr.url,
+      updatedAt: pr.updatedAt,
+      createdAt: pr.createdAt,
+    }));
 }
 
 function fetchPRDetails(repo: string, number: number): PRDetails {
