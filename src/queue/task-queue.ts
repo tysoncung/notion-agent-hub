@@ -2,12 +2,12 @@
  * Task Queue — Poll a Notion database for pending tasks and process them.
  *
  * Expected database schema:
- *   - Name (title): Task name
- *   - Status (status): Pending → Running → Done / Failed
- *   - Type (select): research | github-tracker | content-pipeline
- *   - Input (rich_text): JSON input for the task
- *   - Output (rich_text): JSON result from the task
- *   - Error (rich_text): Error message if failed
+ *   - Task (title): Task name
+ *   - Status (select): Pending → Running → Done / Failed
+ *   - Agent (select): research | github-tracker | content-pipeline
+ *   - Result (rich_text): Result or error message
+ *   - Priority (select): Task priority
+ *   - Approved (checkbox): Human approval flag
  */
 
 import { getNotionClient, richTextToPlain, plainToRichText, getPageTitle } from "../utils/notion-client.js";
@@ -31,7 +31,7 @@ export async function pollPendingTasks(databaseId: string): Promise<Task[]> {
     database_id: databaseId,
     filter: {
       property: "Status",
-      status: { equals: "Pending" },
+      select: { equals: "Pending" },
     },
     sorts: [{ timestamp: "created_time", direction: "ascending" }],
     page_size: 10,
@@ -41,22 +41,11 @@ export async function pollPendingTasks(databaseId: string): Promise<Task[]> {
 
   return response.results.map((page: any) => {
     const props = page.properties;
-    let input = {};
-
-    try {
-      const inputText = props.Input?.rich_text
-        ? richTextToPlain(props.Input.rich_text)
-        : "{}";
-      input = JSON.parse(inputText);
-    } catch {
-      logger.warn("Failed to parse task input", { pageId: page.id });
-    }
-
     return {
       id: page.id,
       name: getPageTitle(props) ?? "Untitled",
-      type: props.Type?.select?.name ?? "unknown",
-      input,
+      type: props.Agent?.select?.name ?? "unknown",
+      input: {},
       url: page.url,
     };
   });
@@ -71,7 +60,7 @@ export async function claimTask(taskId: string): Promise<void> {
   await notion.pages.update({
     page_id: taskId,
     properties: {
-      Status: { status: { name: "Running" } },
+      Status: { select: { name: "Running" } },
     },
   });
 
@@ -89,8 +78,8 @@ export async function completeTask(taskId: string, result: any): Promise<void> {
   await notion.pages.update({
     page_id: taskId,
     properties: {
-      Status: { status: { name: "Done" } },
-      Output: { rich_text: plainToRichText(outputText.substring(0, 2000)) },
+      Status: { select: { name: "Done" } },
+      Result: { rich_text: plainToRichText(outputText.substring(0, 2000)) },
     },
   });
 
@@ -106,8 +95,8 @@ export async function failTask(taskId: string, error: string): Promise<void> {
   await notion.pages.update({
     page_id: taskId,
     properties: {
-      Status: { status: { name: "Failed" } },
-      Error: { rich_text: plainToRichText(error.substring(0, 2000)) },
+      Status: { select: { name: "Failed" } },
+      Result: { rich_text: plainToRichText(`Error: ${error}`.substring(0, 2000)) },
     },
   });
 
