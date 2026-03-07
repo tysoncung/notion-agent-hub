@@ -1,183 +1,268 @@
 /**
- * Content Pipeline Agent — Takes an outline from Notion, generates draft content,
- * and writes it back for human review.
+ * Content Pipeline Agent — Picks up article tasks from the Task Queue,
+ * generates draft content using OpenAI, and writes rich Notion pages
+ * for human review.
  *
  * Workflow:
- * 1. Read the outline page from Notion
- * 2. Generate draft content based on the outline
- * 3. Create a new draft page linked to the outline
- * 4. Set status to "Review" for human approval
+ * 1. Query Task Queue for pending "Content Pipeline" tasks
+ * 2. Generate article draft via OpenAI (gpt-4o-mini)
+ * 3. Create a rich Notion draft page with headings, code blocks, callouts
+ * 4. Update the task with result + "Awaiting Review" status
+ * 5. Human reviews in Notion, checks "Approved" checkbox
  */
 
-import { notionRead } from "../tools/notion-read.js";
-import { notionWrite } from "../tools/notion-write.js";
-import { webSearch } from "../tools/web-search.js";
+import { getNotionClient, plainToRichText } from "../utils/notion-client.js";
 import { logger } from "../utils/logger.js";
 import type { Task } from "../queue/task-queue.js";
+import OpenAI from "openai";
 
-export interface ContentPipelineInput {
-  outline_page_id: string;  // Notion page with the content outline
-  parent_id: string;        // Where to create the draft page
-  research?: boolean;       // Whether to do web research first
+export interface ContentPipelineConfig {
+  taskQueueDbId: string;
+  parentPageId: string;
+  model?: string;         // OpenAI model, default gpt-4o-mini
+  temperature?: number;
+  maxTokens?: number;
+}
+
+// --- Block Helpers ---
+
+function richText(text: string) {
+  const chunks: { type: "text"; text: { content: string } }[] = [];
+  for (let i = 0; i < text.length; i += 2000) {
+    chunks.push({ type: "text", text: { content: text.slice(i, i + 2000) } });
+  }
+  return chunks.length ? chunks : [{ type: "text" as const, text: { content: "" } }];
+}
+
+function paragraph(text: string) {
+  return { object: "block" as const, type: "paragraph" as const, paragraph: { rich_text: richText(text) } };
+}
+
+function heading2(text: string) {
+  return { object: "block" as const, type: "heading_2" as const, heading_2: { rich_text: richText(text) } };
+}
+
+function heading3(text: string) {
+  return { object: "block" as const, type: "heading_3" as const, heading_3: { rich_text: richText(text) } };
+}
+
+function bullet(text: string) {
+  return { object: "block" as const, type: "bulleted_list_item" as const, bulleted_list_item: { rich_text: richText(text) } };
+}
+
+function codeBlock(code: string, language = "typescript") {
+  return { object: "block" as const, type: "code" as const, code: { rich_text: richText(code), language } };
+}
+
+function callout(text: string, emoji = "⚠️") {
+  return {
+    object: "block" as const,
+    type: "callout" as const,
+    callout: { rich_text: richText(text), icon: { type: "emoji" as const, emoji } },
+  };
+}
+
+function divider() {
+  return { object: "block" as const, type: "divider" as const, divider: {} };
 }
 
 /**
- * Extract section headers and bullet points from Notion blocks.
+ * Parse markdown output from OpenAI into Notion block objects.
  */
-function extractOutline(content: Array<{ type: string; text: string }>) {
-  const sections: Array<{ heading: string; points: string[] }> = [];
-  let currentSection: { heading: string; points: string[] } | null = null;
+function markdownToBlocks(markdown: string): any[] {
+  const lines = markdown.split("\n");
+  const blocks: any[] = [];
 
-  for (const block of content) {
-    if (block.type.startsWith("heading_")) {
-      if (currentSection) sections.push(currentSection);
-      currentSection = { heading: block.text, points: [] };
-    } else if (
-      block.type === "bulleted_list_item" ||
-      block.type === "numbered_list_item"
-    ) {
-      if (currentSection) {
-        currentSection.points.push(block.text);
+  let inCodeBlock = false;
+  let codeLines: string[] = [];
+  let codeLang = "typescript";
+
+  for (const line of lines) {
+    if (line.trim().startsWith("```")) {
+      if (inCodeBlock) {
+        blocks.push(codeBlock(codeLines.join("\n"), codeLang));
+        codeLines = [];
+        inCodeBlock = false;
+      } else {
+        inCodeBlock = true;
+        codeLang = line.trim().replace("```", "").trim() || "typescript";
       }
-    } else if (block.type === "paragraph" && block.text) {
-      if (currentSection) {
-        currentSection.points.push(block.text);
-      }
+      continue;
     }
-  }
 
-  if (currentSection) sections.push(currentSection);
-  return sections;
-}
+    if (inCodeBlock) {
+      codeLines.push(line);
+      continue;
+    }
 
-/**
- * Generate draft content blocks from an outline.
- * In production, this would call an LLM (OpenAI, etc.).
- * For now, it creates a structured draft template.
- */
-function generateDraftBlocks(
-  title: string,
-  sections: Array<{ heading: string; points: string[] }>,
-  research?: Array<{ title: string; snippet: string; url: string }>
-) {
-  const blocks: any[] = [
-    { type: "callout", text: "📝 DRAFT — This content was auto-generated and needs human review before publishing." },
-    { type: "divider" },
-  ];
+    const trimmed = line.trim();
+    if (!trimmed) continue;
 
-  // Add research section if available
-  if (research?.length) {
-    blocks.push(
-      { type: "heading_2", text: "Background Research" },
-      {
-        type: "toggle",
-        text: `${research.length} sources consulted`,
-        children: research.map((r) => ({
-          type: "paragraph" as const,
-          text: `${r.title}: ${r.snippet} (${r.url})`,
-        })),
-      },
-      { type: "divider" }
-    );
-  }
-
-  // Expand each section from the outline
-  for (const section of sections) {
-    blocks.push({ type: "heading_2", text: section.heading });
-
-    if (section.points.length > 0) {
-      // Create paragraph from points as a draft expansion
-      blocks.push({
-        type: "paragraph",
-        text: `[Draft content for "${section.heading}"] — Expand on the following points:`,
-      });
-
-      for (const point of section.points) {
-        blocks.push({ type: "bulleted_list_item", text: point });
-      }
+    if (trimmed.startsWith("## ")) {
+      blocks.push(heading2(trimmed.slice(3)));
+    } else if (trimmed.startsWith("### ")) {
+      blocks.push(heading3(trimmed.slice(4)));
+    } else if (trimmed.startsWith("- ") || trimmed.startsWith("* ")) {
+      blocks.push(bullet(trimmed.slice(2)));
     } else {
-      blocks.push({
-        type: "paragraph",
-        text: `[Draft content needed for "${section.heading}"]`,
-      });
+      blocks.push(paragraph(trimmed));
     }
-
-    blocks.push({ type: "paragraph", text: "" }); // spacing
   }
 
-  blocks.push(
-    { type: "divider" },
-    { type: "heading_2", text: "Review Checklist" },
-    { type: "bulleted_list_item", text: "☐ Accuracy — verify all facts and claims" },
-    { type: "bulleted_list_item", text: "☐ Tone — matches brand voice" },
-    { type: "bulleted_list_item", text: "☐ Completeness — all sections filled out" },
-    { type: "bulleted_list_item", text: "☐ Sources — properly cited" },
-    { type: "bulleted_list_item", text: "☐ Approved for publishing" }
-  );
+  if (inCodeBlock && codeLines.length) {
+    blocks.push(codeBlock(codeLines.join("\n"), codeLang));
+  }
 
   return blocks;
 }
 
 /**
- * Run the content pipeline agent.
+ * Generate an article draft using OpenAI.
  */
-export async function runContentPipeline(input: ContentPipelineInput) {
-  logger.info("Starting content pipeline", { outlinePageId: input.outline_page_id });
+async function generateArticle(title: string, config: ContentPipelineConfig): Promise<string> {
+  const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-  // Step 1: Read the outline
-  const outlinePage = await notionRead({ page_id: input.outline_page_id }) as {
-    id: string; title: string | null; url: string; properties: any;
-    content: Array<{ type: string; text: string; id: string }>;
-  };
-  const title = outlinePage.title ?? "Untitled Content";
-  const sections = extractOutline(outlinePage.content);
+  const completion = await openai.chat.completions.create({
+    model: config.model ?? "gpt-4o-mini",
+    messages: [
+      {
+        role: "system",
+        content: `You are a technical content writer for Dev.to. Write engaging, practical articles for developers.
+Use markdown formatting:
+- ## for main sections (3-5 sections)
+- ### for subsections
+- \`\`\`typescript or \`\`\`bash for code blocks
+- Bullet lists with - for key points
+- Keep paragraphs concise (2-4 sentences)
 
-  logger.info("Parsed outline", { title, sections: sections.length });
+Target: 800-1200 words. Include an intro, practical sections with code examples, and a conclusion with a call to action.
+Do NOT include a title — the title is provided separately.`,
+      },
+      {
+        role: "user",
+        content: `Write a full article draft for: "${title}"`,
+      },
+    ],
+    temperature: config.temperature ?? 0.7,
+    max_tokens: config.maxTokens ?? 3000,
+  });
 
-  // Step 2: Optional research
-  let research: Array<{ title: string; snippet: string; url: string }> | undefined;
-
-  if (input.research) {
-    const searchResult = await webSearch({ query: title, count: 3 });
-    research = searchResult.results;
-    logger.info("Research complete", { sources: research.length });
-  }
-
-  // Step 3: Generate draft blocks
-  const blocks = generateDraftBlocks(title, sections, research);
-
-  // Step 4: Create the draft page
-  const page = await notionWrite({
-    action: "create",
-    parent_id: input.parent_id,
-    title: `[DRAFT] ${title}`,
-    icon: "📝",
-    blocks,
-  }) as { id: string; url: string; created: boolean };
-
-  logger.info("Draft page created", { pageId: page.id, url: page.url });
-
-  return {
-    page_id: page.id,
-    page_url: page.url,
-    title,
-    sections_count: sections.length,
-    has_research: !!research,
-  };
+  return completion.choices[0].message.content ?? "";
 }
 
 /**
- * Task queue handler for content pipeline tasks.
+ * Run the content pipeline: query tasks, generate content, create pages.
+ */
+export async function runContentPipeline(config: ContentPipelineConfig) {
+  const notion = getNotionClient();
+
+  logger.info("Querying Task Queue for pending Content Pipeline tasks...");
+  const queryResult = await notion.databases.query({
+    database_id: config.taskQueueDbId,
+    filter: {
+      and: [
+        { property: "Status", select: { equals: "Pending" } },
+        { property: "Agent", select: { equals: "Content Pipeline" } },
+      ],
+    },
+  });
+
+  if (queryResult.results.length === 0) {
+    logger.info("No pending Content Pipeline tasks found.");
+    return { processed: 0 };
+  }
+
+  const results: Array<{ taskId: string; draftUrl: string; title: string }> = [];
+
+  for (const page of queryResult.results) {
+    const task = page as any;
+    const taskId = task.id;
+    const taskTitle = task.properties.Task.title
+      .map((t: any) => t.plain_text)
+      .join("");
+
+    logger.info(`Processing task: "${taskTitle}"`);
+
+    // Set status → Running
+    await notion.pages.update({
+      page_id: taskId,
+      properties: { Status: { select: { name: "Running" } } },
+    });
+
+    try {
+      // Generate article
+      const articleMarkdown = await generateArticle(taskTitle, config);
+      const articleBlocks = markdownToBlocks(articleMarkdown);
+      const wordCount = articleMarkdown.split(/\s+/).length;
+
+      logger.info(`Generated ${wordCount} words of content`);
+
+      // Create draft page (max 100 children per request)
+      const firstBatch = [
+        callout("⚠️ DRAFT — Awaiting human review. Check the Approved box in the Task Queue when satisfied.", "⚠️"),
+        divider(),
+        ...articleBlocks.slice(0, 98),
+      ];
+
+      const displayTitle = taskTitle.replace(/^Write article:\s*/i, "");
+      const draftPage = await notion.pages.create({
+        parent: { page_id: config.parentPageId },
+        icon: { type: "emoji", emoji: "📝" },
+        properties: {
+          title: { title: plainToRichText(`[DRAFT] ${displayTitle}`) },
+        },
+        children: firstBatch as any,
+      });
+
+      const draftUrl = (draftPage as any).url;
+      const draftId = (draftPage as any).id;
+
+      // Append remaining blocks
+      if (articleBlocks.length > 98) {
+        const remaining = articleBlocks.slice(98);
+        for (let i = 0; i < remaining.length; i += 100) {
+          await notion.blocks.children.append({
+            block_id: draftId,
+            children: remaining.slice(i, i + 100) as any,
+          });
+        }
+      }
+
+      // Update task
+      const resultSummary = `Draft created: "${displayTitle}" (~${wordCount} words)\n\nDraft page: ${draftUrl}\n\nReview the draft in Notion and check "Approved" when ready.`;
+
+      await notion.pages.update({
+        page_id: taskId,
+        properties: {
+          Status: { select: { name: "Awaiting Review" } },
+          Result: { rich_text: richText(resultSummary) as any },
+        },
+      });
+
+      results.push({ taskId, draftUrl, title: displayTitle });
+      logger.info(`Draft created: ${draftUrl}`);
+    } catch (error) {
+      logger.error(`Failed to process task ${taskId}`, error);
+      await notion.pages.update({
+        page_id: taskId,
+        properties: {
+          Status: { select: { name: "Pending" } },
+          Result: { rich_text: richText(`Error: ${(error as Error).message}`) as any },
+        },
+      });
+    }
+  }
+
+  return { processed: results.length, results };
+}
+
+/**
+ * Task queue handler for content pipeline tasks (legacy interface).
  */
 export async function handleContentPipelineTask(task: Task) {
-  const input = task.input as ContentPipelineInput;
-
-  if (!input.outline_page_id) {
-    throw new Error("Content pipeline task requires 'outline_page_id' in input");
-  }
-  if (!input.parent_id) {
-    throw new Error("Content pipeline task requires 'parent_id' in input");
-  }
-
-  return runContentPipeline(input);
+  const input = task.input as { taskQueueDbId: string; parentPageId: string };
+  return runContentPipeline({
+    taskQueueDbId: input.taskQueueDbId,
+    parentPageId: input.parentPageId,
+  });
 }
