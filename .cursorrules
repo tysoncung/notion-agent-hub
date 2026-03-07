@@ -1,0 +1,45 @@
+# Cursor Rules for Notion Agent Hub
+
+## Project Context
+This is an MCP (Model Context Protocol) server that provides Notion integration tools and AI agent workflows. Built with TypeScript, using the MCP SDK for server implementation.
+
+## Code Style
+- TypeScript strict mode
+- ES modules (import/export, .js extensions in imports)
+- Zod for input validation
+- Functional style preferred over classes
+- Descriptive variable names, JSDoc comments on exports
+
+## MCP Patterns
+- Tools are registered via `server.tool()` with Zod schemas
+- Tool handlers return `{ content: [{ type: "text", text: string }] }`
+- Errors return `{ content: [...], isError: true }`
+- Server uses stdio transport (stdout reserved for MCP)
+- All logging goes to stderr via the logger utility
+
+## Notion API
+- Use @notionhq/client for all Notion operations
+- Singleton client via `getNotionClient()`
+- Handle rich_text arrays with `richTextToPlain()` / `plainToRichText()`
+- Page properties vary by type — check `prop.type` before accessing
+- Database queries support filters, sorts, and pagination
+
+## File Organization
+- `src/tools/` — Individual MCP tools (one per file)
+- `src/agents/` — Agent workflows that compose tools
+- `src/queue/` — Task queue for Notion DB polling
+- `src/utils/` — Shared utilities (Notion client, logger)
+- `tests/tools/` — Vitest unit tests with mocked Notion client
+
+## Testing
+- Use vitest for testing
+- Mock the Notion client in tests (vi.mock)
+- Test tool functions directly, not MCP handlers
+- Each tool has its own test file
+
+## Environment Variables
+- NOTION_API_KEY — Required for Notion operations
+- NOTION_DATABASE_ID — Default database for task queue
+- OPENAI_API_KEY — Optional, for content generation
+- BRAVE_API_KEY — Optional, for web search
+- LOG_LEVEL — debug | info | warn | error (default: info)
