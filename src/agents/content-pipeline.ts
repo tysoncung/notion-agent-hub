@@ -242,7 +242,7 @@ export async function runContentPipeline(config: ContentPipelineConfig) {
       results.push({ taskId, draftUrl, title: displayTitle });
       logger.info(`Draft created: ${draftUrl}`);
     } catch (error) {
-      logger.error(`Failed to process task ${taskId}`, error);
+      logger.error(`Failed to process task ${taskId}`, { error });
       await notion.pages.update({
         page_id: taskId,
         properties: {
