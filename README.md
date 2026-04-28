@@ -1,3 +1,5 @@
+[![MseeP.ai Security Assessment Badge](https://mseep.net/pr/tysoncung-notion-agent-hub-badge.png)](https://mseep.ai/app/tysoncung-notion-agent-hub)
+
 # 🤖 Notion Agent Hub
 
 > **AI Agent Hub for Notion** — orchestrate AI agents through Notion databases with human-in-the-loop approval. Built with MCP.
